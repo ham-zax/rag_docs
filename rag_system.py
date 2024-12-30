@@ -12,7 +12,8 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.models import Distance, VectorParams
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-# Load environment variables
+from langchain.memory import ConversationBufferMemory
+from langchain.schema import HumanMessage, AIMessage
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -23,11 +24,11 @@ class RAGConfig:
     chunk_size: int = 600
     chunk_overlap: int = 150
     embedding_model: str = "text-embedding-3-small"
-    completion_model: str = "gpt-4o-mini"
+    completion_model: str = "gpt-4-turbo-preview"
     embedding_dimension: int = 1536
     max_context_chunks: int = 12
     qdrant_path: str = "./qdrant_data"
-    
+
 class RAGSystem:
     def __init__(self, config: Optional[RAGConfig] = None):
         """Initialize RAG system with optional configuration"""
@@ -41,10 +42,13 @@ class RAGSystem:
         self.qdrant = QdrantClient(path=self.config.qdrant_path)
         self._init_collection()
         
-        # Conversation history
-        self.conversation_history: List[Dict[str, str]] = []
+        # Initialize LangChain memory
+        self.memory = ConversationBufferMemory(
+            return_messages=True,
+            memory_key="chat_history"
+        )
         
-        # Add to existing init
+        # Usage statistics
         self.usage_stats = {
             "embedding_tokens": 0,
             "completion_input_tokens": 0,
@@ -62,11 +66,9 @@ class RAGSystem:
                     size=self.config.embedding_dimension,
                     distance=Distance.COSINE
                 ),
-                # Enable payload indexing for hybrid search
                 optimizers_config=models.OptimizersConfigDiff(
-                    indexing_threshold=0,  # Index all vectors
+                    indexing_threshold=0,
                 ),
-                # Enable full-text search on content field
                 on_disk_payload=True
             )
             
@@ -80,7 +82,6 @@ class RAGSystem:
             encoding = tiktoken.encoding_for_model(self.config.embedding_model)
             num_tokens = len(encoding.encode(content))
             
-            # Calculate costs
             embedding_cost = (num_tokens / 1_000_000) * 0.02
             estimated_completion_tokens = num_tokens * 0.2
             completion_cost = (estimated_completion_tokens / 1_000_000) * (0.15 + 0.60)
@@ -95,7 +96,7 @@ class RAGSystem:
             raise Exception(f"Error estimating costs: {str(e)}")
 
     def load_document(self, file_path: str) -> Optional[str]:
-        """Enhanced load_document with cost estimation and user confirmation"""
+        """Load and process document with cost estimation"""
         try:
             doc = pymupdf.open(file_path)
             num_pages = doc.page_count
@@ -105,7 +106,6 @@ class RAGSystem:
             doc.close()
 
             if num_pages > 25:
-                # Get cost estimates
                 costs = self.estimate_processing_costs(content)
                 
                 print(f"""
@@ -126,7 +126,6 @@ Would you like to proceed? (yes/no)""")
                     print("Processing cancelled")
                     return None
 
-            # Continue with existing processing...
             doc_hash = self._get_document_hash(content)
             existing = self.qdrant.scroll(
                 collection_name=self.config.collection_name,
@@ -149,10 +148,8 @@ Would you like to proceed? (yes/no)""")
 
     def process_text(self, text: str, doc_hash: str) -> None:
         """Process text and store in Qdrant"""
-        # Split text into chunks
         chunks = self.text_splitter.split_text(text)
         
-        # Prepare points for Qdrant
         points = []
         for i, chunk in enumerate(chunks):
             embedding = self.get_embedding(chunk)
@@ -168,7 +165,6 @@ Would you like to proceed? (yes/no)""")
                 }
             ))
             
-        # Upload to Qdrant in batches
         BATCH_SIZE = 100
         for i in range(0, len(points), BATCH_SIZE):
             batch = points[i:i + BATCH_SIZE]
@@ -182,7 +178,6 @@ Would you like to proceed? (yes/no)""")
         if not text or not text.strip():
             raise ValueError("Empty or invalid input text")
         try:
-            # Ensure text is properly formatted
             cleaned_text = text.strip()
             response = openai.embeddings.create(
                 input=cleaned_text,
@@ -194,7 +189,7 @@ Would you like to proceed? (yes/no)""")
             embedding = response.data[0].embedding
             if len(embedding) != self.config.embedding_dimension:
                 raise ValueError(f"Invalid embedding dimension: {len(embedding)}")    
-            # Track embedding tokens
+            
             self.usage_stats["embedding_tokens"] += response.usage.total_tokens
             return embedding
         except Exception as e:
@@ -202,7 +197,7 @@ Would you like to proceed? (yes/no)""")
             return []
             
     def query(self, question: str) -> Optional[str]:
-        """Query the RAG system with hybrid search"""
+        """Query the RAG system with LangChain memory"""
         if not question or not question.strip():
             return "Please provide a valid question."
         
@@ -210,86 +205,64 @@ Would you like to proceed? (yes/no)""")
             question_embedding = self.get_embedding(question)
             if not question_embedding:
                 return "Unable to process question. Please try again."
-            # Generate question embedding
-            question_embedding = self.get_embedding(question)
             
-            # Hybrid search using both semantic and keyword matching
             search_result = self.qdrant.search(
                 collection_name=self.config.collection_name,
                 query_vector=question_embedding,
-                query_filter=None,  # Can add filters if needed
+                query_filter=None,
                 limit=self.config.max_context_chunks,
                 search_params=models.SearchParams(
-                    hnsw_ef=128,  # Increase for better recall
-                    exact=False   # Set to True for exact search
+                    hnsw_ef=128,
+                    exact=False
                 ),
                 with_payload=True,
-                score_threshold=0.0  # Adjust based on needs
+                score_threshold=0.0
             )
             
-            # Extract relevant chunks
             relevant_chunks = [hit.payload["content"] for hit in search_result]
             
-            # Generate answer
-            answer = self.generate_answer(question, relevant_chunks)
+            # Get conversation history from LangChain memory
+            history = self.memory.load_memory_variables({})
+            history_str = "\n".join([
+                f"{'Human' if isinstance(msg, HumanMessage) else 'Assistant'}: {msg.content}"
+                for msg in history.get("chat_history", [])
+            ])
             
-            # Update conversation history
-            self.conversation_history.append({
-                "question": question,
-                "answer": answer,
-                "timestamp": datetime.now().isoformat()
-            })
+            prompt = f"""You are a helpful assistant. Consider the previous conversation and context to answer the question.
+            If the answer cannot be derived from the context or conversation history, say so.
+
+            Previous conversation:
+            {history_str}
+
+            Context:
+            {' '.join(relevant_chunks)}
+
+            Question: {question}
+
+            Answer:"""
+            
+            response = openai.chat.completions.create(
+                model=self.config.completion_model,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            answer = response.choices[0].message.content
+            
+            # Save to memory
+            self.memory.save_context(
+                {"input": question},
+                {"output": answer}
+            )
+            
+            # Track token usage
+            self.usage_stats["completion_input_tokens"] += response.usage.prompt_tokens
+            self.usage_stats["completion_output_tokens"] += response.usage.completion_tokens
             
             return answer
             
         except Exception as e:
             print(f"Error during query: {e}")
             return None
-            
-    def generate_answer(self, question: str, context_chunks: List[str]) -> str:
-        """Generate answer using conversation history and context"""
-        try:
-            # Build context from chunks and recent conversation
-            context = "\n\n---\n\n".join(context_chunks)
-            
-            # Include recent conversation history
-            conv_context = ""
-            if self.conversation_history:
-                recent_conv = self.conversation_history[-3:]  # Last 3 exchanges
-                conv_context = "\n".join([
-                    f"Q: {conv['question']}\nA: {conv['answer']}"
-                    for conv in recent_conv
-                ])
-            
-            # Build prompt
-            prompt = f"""Please answer the following question based on the provided context.
-            If the answer cannot be derived from the context, say so.
-
-            Previous conversation:
-            {conv_context}
-
-            Context:
-            {context}
-
-            Question: {question}
-            
-            Answer:"""
-            
-            # Generate response
-            response = openai.chat.completions.create(
-                model=self.config.completion_model,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            
-            # Track completion tokens
-            self.usage_stats["completion_input_tokens"] += response.usage.prompt_tokens
-            self.usage_stats["completion_output_tokens"] += response.usage.completion_tokens
-            
-            return response.choices[0].message.content
-            
-        except Exception as e:
-            print(f"Error generating answer: {e}")
-            return ""
 
     def calculate_final_costs(self) -> Dict[str, float]:
         """Calculate final costs based on usage"""
@@ -310,7 +283,7 @@ Would you like to proceed? (yes/no)""")
         }
 
 def main():
-    """Modified main function with cost reporting"""
+    """Main function with interactive query loop and cost reporting"""
     config = RAGConfig(
         chunk_size=1000,
         chunk_overlap=200,
@@ -320,18 +293,23 @@ def main():
     rag = RAGSystem(config)
     
     try:
-        # Load document
-        text = rag.load_document("report.pdf")
+        # Get document path from user
+        doc_path = input("Enter the path to your document: ")
+        text = rag.load_document(doc_path)
+        
+        if text is None:
+            print("Failed to load document. Exiting.")
+            return
         
         # Interactive query loop
         while True:
-            question = input("Enter your question (or 'quit' to exit): ")
+            question = input("\nEnter your question (or 'quit' to exit): ")
             if question.lower() == 'quit':
                 break
                 
             answer = rag.query(question)
             if answer:
-                print(f"Answer: {answer}")
+                print(f"\nAnswer: {answer}")
         
         # Display final costs
         final_costs = rag.calculate_final_costs()
