@@ -105,7 +105,7 @@ class RAGSystem:
                 content += page.get_text()
             doc.close()
 
-            if num_pages > 25:
+            if num_pages > 50:
                 costs = self.estimate_processing_costs(content)
                 
                 print(f"""
