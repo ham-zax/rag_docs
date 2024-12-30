@@ -168,9 +168,13 @@ class RAGSystem:
             print(f"Query error: {e}")
             return None
 
+    def get_embedding_cost(self) -> float:
+        """Calculate the cost of embedding tokens."""
+        return (self.usage_stats["embedding_tokens"] / 1_000_000) * self.config.embedding_price_per_million
+
     def get_final_costs(self) -> Dict[str, float]:
         """Calculate final costs"""
-        embedding_cost = (self.usage_stats["embedding_tokens"] / 1_000_000) * self.config.embedding_price_per_million
+        embedding_cost = self.get_embedding_cost()
         completion_cost = (self.usage_stats["completion_tokens"] / 1_000_000) * (
             self.config.completion_input_price_per_million + self.config.completion_output_price_per_million
         )
@@ -188,6 +192,8 @@ def main():
             while True:
                 question = input("\nEnter question (or 'quit'): ")
                 if question.lower() == 'quit':
+                    embedding_cost = rag.get_embedding_cost()
+                    print(f"\nEmbedding cost for this session: ${embedding_cost:.4f}")
                     break
                     
                 if answer := rag.query(question):
