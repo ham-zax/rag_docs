@@ -7,6 +7,7 @@ from datetime import datetime
 
 import openai
 import pymupdf
+import tiktoken
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.models import Distance, VectorParams
@@ -65,44 +66,82 @@ class RAGSystem:
     def _get_document_hash(self, content: str) -> str:
         """Generate hash for document content"""
         return hashlib.md5(content.encode()).hexdigest()
-        
-def load_document(self, file_path: str) -> Optional[str]:
-    """Load document and process if not already in database"""
-    try:
-        # Load document
-        doc = pymupdf.open(file_path)
-        num_pages = doc.page_count
-        content = ""
-        for page in doc:
-            content += page.get_text()
-        doc.close()
+    
+    def estimate_processing_costs(self, content: str) -> Dict[str, float]:
+        """Estimate processing costs for both embedding and completion"""
+        try:
+            encoding = tiktoken.encoding_for_model(self.config.embedding_model)
+            num_tokens = len(encoding.encode(content))
+            
+            # Calculate costs
+            embedding_cost = (num_tokens / 1_000_000) * 0.02
+            estimated_completion_tokens = num_tokens * 0.2
+            completion_cost = (estimated_completion_tokens / 1_000_000) * (0.15 + 0.60)
+            
+            return {
+                "num_tokens": num_tokens,
+                "embedding_cost": embedding_cost,
+                "completion_cost": completion_cost,
+                "total_cost": embedding_cost + completion_cost
+            }
+        except Exception as e:
+            raise Exception(f"Error estimating costs: {str(e)}")
 
-        if num_pages > 25:
-            print(f"Warning: Document '{file_path}' has {num_pages} pages, which is greater than 25. Processing may take longer.")
+    def load_document(self, file_path: str) -> Optional[str]:
+        """Enhanced load_document with cost estimation and user confirmation"""
+        try:
+            doc = pymupdf.open(file_path)
+            num_pages = doc.page_count
+            content = ""
+            for page in doc:
+                content += page.get_text()
+            doc.close()
 
-        # Check if document already processed
-        doc_hash = self._get_document_hash(content)
-        existing = self.qdrant.scroll(
-            collection_name=self.config.collection_name,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="doc_hash",
-                        match=models.MatchValue(value=doc_hash)
-                    )
-                ]
+            if num_pages > 25:
+                # Get cost estimates
+                costs = self.estimate_processing_costs(content)
+                
+                print(f"""
+Large Document Warning
+---------------------
+Document: {file_path}
+Pages: {num_pages}
+Estimated tokens: {costs['num_tokens']:,}
+Cost Breakdown:
+- Embedding: ${costs['embedding_cost']:.4f}
+- Completion: ${costs['completion_cost']:.4f}
+Total estimated cost: ${costs['total_cost']:.4f}
+
+Would you like to proceed? (yes/no)""")
+                
+                response = input().lower()
+                if response != 'yes':
+                    print("Processing cancelled")
+                    return None
+
+            # Continue with existing processing...
+            doc_hash = self._get_document_hash(content)
+            existing = self.qdrant.scroll(
+                collection_name=self.config.collection_name,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="doc_hash",
+                            match=models.MatchValue(value=doc_hash)
+                        )
+                    ]
+                )
             )
-        )
 
-        if not existing[0]:  # Document not found
-            self.process_text(content, doc_hash)
+            if not existing[0]:
+                self.process_text(content, doc_hash)
 
-        return content
+            return content
 
-    except Exception as e:
-        print(f"Error loading document: {e}")
-        return None   
-          
+        except Exception as e:
+            print(f"Error loading document: {e}")
+            return None
+
     def process_text(self, text: str, doc_hash: str) -> None:
         """Process text and store in Qdrant"""
         # Split text into chunks
@@ -237,7 +276,7 @@ def main():
     
     try:
         # Load document
-        text = rag.load_document("document.pdf")
+        text = rag.load_document("constitutionofindiaacts.pdf")
         
         # Interactive query loop
         while True:
