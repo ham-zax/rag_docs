@@ -24,7 +24,7 @@ class RAGConfig:
     embedding_model: str = "text-embedding-3-small"
     completion_model: str = "gpt-4o-mini"
     embedding_dimension: int = 1536
-    max_context_chunks: int = 5
+    max_context_chunks: int = 10
     qdrant_path: str = "./qdrant_data"
     
 class RAGSystem:
