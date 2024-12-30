@@ -10,9 +10,9 @@ import tiktoken
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.models import Distance, VectorParams
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.memory import ConversationBufferMemory
-from langchain.schema import HumanMessage
+from langchain_core.messages import HumanMessage
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -91,7 +91,7 @@ class RAGSystem:
         """Simplified text processing"""
         chunks = self.text_splitter.split_text(text)
         points = []
-        
+
         for i, chunk in enumerate(chunks):
             embedding = self.get_embedding(chunk)
             if embedding:
@@ -186,7 +186,7 @@ class RAGSystem:
 
 def main():
     rag = RAGSystem()
-    
+
     try:
         if rag.load_document("report.pdf"):
             while True:
@@ -195,13 +195,13 @@ def main():
                     embedding_cost = rag.get_embedding_cost()
                     print(f"\nEmbedding cost for this session: ${embedding_cost:.4f}")
                     break
-                    
+
                 if answer := rag.query(question):
                     print(f"\nAnswer: {answer}")
-            
+
             costs = rag.get_final_costs()
             print(f"\nTotal cost: ${costs['total_cost']:.4f}")
-                    
+
     except Exception as e:
         print(f"Error: {e}")
 
