@@ -26,12 +26,12 @@ load_dotenv()
 class RAGConfig:
     """Streamlined configuration for RAG system"""
     collection_name: str = "documents"
-    chunk_size: int = 600
+    chunk_size: int = 800
     chunk_overlap: int = 150
     embedding_model: str = "text-embedding-3-small"
     completion_model: str = "gpt-4o-mini"
     embedding_dimension: int = 1536
-    max_context_chunks: int = 12
+    max_context_chunks: int = 10
     qdrant_path: str = "./qdrant_data"
     message_store_path: str = "./message_store"
     embedding_price_per_million: float = 0.02
@@ -158,6 +158,10 @@ class RAGSystem:
             if not question_embedding:
                 return "Unable to process question."
 
+            # Debug: Print question embedding (truncated)
+            # print("\nDEBUG: Question Embedding (first 5 dimensions):")
+            # print(question_embedding[:5])
+
             search_result = self.qdrant.search(
                 collection_name=self.config.collection_name,
                 query_vector=question_embedding,
@@ -165,23 +169,32 @@ class RAGSystem:
                 with_payload=True
             )
 
+            # Debug: Print search results with scores
+            # print("\nDEBUG: Top matched chunks with scores:")
+            # for i, hit in enumerate(search_result):
+                # print(f"\nMatch {i+1} (Score: {hit.score:.4f}):")
+                # # print(f"Content preview: {hit.payload['content'][:200]}...")
+
             context = " ".join(hit.payload["content"] for hit in search_result)
-            
-            # Invoke chain with history
+
+            # Debug: Print context length and preview
+            # print(f"\nDEBUG: Total context length: {len(context)} characters")
+            # print(f"Context preview: {context[:200]}...")
+
             response = self.chain_with_history.invoke(
                 {"question": question, "context": context},
                 config={"configurable": {"session_id": session_id}}
             )
-            
-            # Estimate token usage for cost tracking
+
             estimated_tokens = len(response.split()) * self.config.completion_token_estimation_multiplier
             self.usage_stats["completion_tokens"] += int(estimated_tokens)
-            
+
             return response
 
         except Exception as e:
             print(f"Query error: {e}")
             return None
+
 
     def get_embedding_cost(self) -> float:
         """Calculate embedding cost"""
