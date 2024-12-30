@@ -19,12 +19,12 @@ load_dotenv()
 class RAGConfig:
     """Configuration for RAG system"""
     collection_name: str = "documents"
-    chunk_size: int = 500
-    chunk_overlap: int = 100
+    chunk_size: int = 600
+    chunk_overlap: int = 150
     embedding_model: str = "text-embedding-3-small"
     completion_model: str = "gpt-4o-mini"
     embedding_dimension: int = 1536
-    max_context_chunks: int = 10
+    max_context_chunks: int = 12
     qdrant_path: str = "./qdrant_data"
     
 class RAGSystem:
@@ -66,39 +66,43 @@ class RAGSystem:
         """Generate hash for document content"""
         return hashlib.md5(content.encode()).hexdigest()
         
-    def load_document(self, file_path: str) -> Optional[str]:
-        """Load document and process if not already in database"""
-        try:
-            # Load document
-            doc = pymupdf.open(file_path)
-            content = ""
-            for page in doc:
-                content += page.get_text()
-            doc.close()
-            
-            # Check if document already processed
-            doc_hash = self._get_document_hash(content)
-            existing = self.qdrant.scroll(
-                collection_name=self.config.collection_name,
-                scroll_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="doc_hash",
-                            match=models.MatchValue(value=doc_hash)
-                        )
-                    ]
-                )
+def load_document(self, file_path: str) -> Optional[str]:
+    """Load document and process if not already in database"""
+    try:
+        # Load document
+        doc = pymupdf.open(file_path)
+        num_pages = doc.page_count
+        content = ""
+        for page in doc:
+            content += page.get_text()
+        doc.close()
+
+        if num_pages > 25:
+            print(f"Warning: Document '{file_path}' has {num_pages} pages, which is greater than 25. Processing may take longer.")
+
+        # Check if document already processed
+        doc_hash = self._get_document_hash(content)
+        existing = self.qdrant.scroll(
+            collection_name=self.config.collection_name,
+            scroll_filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="doc_hash",
+                        match=models.MatchValue(value=doc_hash)
+                    )
+                ]
             )
-            
-            if not existing[0]:  # Document not found
-                self.process_text(content, doc_hash)
-                
-            return content
-            
-        except Exception as e:
-            print(f"Error loading document: {e}")
-            return None
-            
+        )
+
+        if not existing[0]:  # Document not found
+            self.process_text(content, doc_hash)
+
+        return content
+
+    except Exception as e:
+        print(f"Error loading document: {e}")
+        return None   
+          
     def process_text(self, text: str, doc_hash: str) -> None:
         """Process text and store in Qdrant"""
         # Split text into chunks
