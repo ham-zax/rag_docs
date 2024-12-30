@@ -24,10 +24,14 @@ class RAGConfig:
     chunk_size: int = 600
     chunk_overlap: int = 150
     embedding_model: str = "text-embedding-3-small"
-    completion_model: str = "gpt-4-turbo-preview"
+    completion_model: str = "gpt-4o-mini"
     embedding_dimension: int = 1536
     max_context_chunks: int = 12
-    qdrant_path: str = "./qdrant_data"
+    qdrant_path: str = "./qdrant_data" 
+    embedding_price_per_million: float = 0.02
+    completion_input_price_per_million: float = 0.015  
+    completion_output_price_per_million: float = 0.60  
+    completion_token_estimation_multiplier: float = 0.2  
 
 class RAGSystem:
     def __init__(self, config: Optional[RAGConfig] = None):
@@ -75,25 +79,6 @@ class RAGSystem:
     def _get_document_hash(self, content: str) -> str:
         """Generate hash for document content"""
         return hashlib.md5(content.encode()).hexdigest()
-    
-    def estimate_processing_costs(self, content: str) -> Dict[str, float]:
-        """Estimate processing costs for both embedding and completion"""
-        try:
-            encoding = tiktoken.encoding_for_model(self.config.embedding_model)
-            num_tokens = len(encoding.encode(content))
-            
-            embedding_cost = (num_tokens / 1_000_000) * 0.02
-            estimated_completion_tokens = num_tokens * 0.2
-            completion_cost = (estimated_completion_tokens / 1_000_000) * (0.15 + 0.60)
-            
-            return {
-                "num_tokens": num_tokens,
-                "embedding_cost": embedding_cost,
-                "completion_cost": completion_cost,
-                "total_cost": embedding_cost + completion_cost
-            }
-        except Exception as e:
-            raise Exception(f"Error estimating costs: {str(e)}")
 
     def load_document(self, file_path: str) -> Optional[str]:
         """Load and process document with cost estimation"""
@@ -264,11 +249,39 @@ Would you like to proceed? (yes/no)""")
             print(f"Error during query: {e}")
             return None
 
+    def estimate_processing_costs(self, content: str) -> Dict[str, float]:
+        """Estimate processing costs for both embedding and completion"""
+        try:
+            encoding = tiktoken.encoding_for_model(self.config.embedding_model)
+            num_tokens = len(encoding.encode(content))
+            
+            # Calculate embedding cost
+            embedding_cost = (num_tokens / 1_000_000) * self.config.embedding_price_per_million
+            
+            # Estimate completion tokens using configurable multiplier
+            estimated_completion_input_tokens = num_tokens
+            estimated_completion_output_tokens = int(num_tokens * self.config.completion_token_estimation_multiplier)
+            
+            # Calculate completion costs separately for input and output
+            completion_input_cost = (estimated_completion_input_tokens / 1_000_000) * self.config.completion_input_price_per_million
+            completion_output_cost = (estimated_completion_output_tokens / 1_000_000) * self.config.completion_output_price_per_million
+            total_completion_cost = completion_input_cost + completion_output_cost
+            
+            return {
+                "num_tokens": num_tokens,
+                "embedding_cost": embedding_cost,
+                "completion_input_cost": completion_input_cost,
+                "completion_output_cost": completion_output_cost,
+                "total_cost": embedding_cost + total_completion_cost
+            }
+        except Exception as e:
+            raise Exception(f"Error estimating costs: {str(e)}")
+
     def calculate_final_costs(self) -> Dict[str, float]:
         """Calculate final costs based on usage"""
-        embedding_cost = (self.usage_stats["embedding_tokens"] / 1_000_000) * 0.02
-        completion_input_cost = (self.usage_stats["completion_input_tokens"] / 1_000_000) * 0.15
-        completion_output_cost = (self.usage_stats["completion_output_tokens"] / 1_000_000) * 0.60
+        embedding_cost = (self.usage_stats["embedding_tokens"] / 1_000_000) * self.config.embedding_price_per_million
+        completion_input_cost = (self.usage_stats["completion_input_tokens"] / 1_000_000) * self.config.completion_input_price_per_million
+        completion_output_cost = (self.usage_stats["completion_output_tokens"] / 1_000_000) * self.config.completion_output_price_per_million
         
         total_cost = embedding_cost + completion_input_cost + completion_output_cost
         
@@ -293,9 +306,8 @@ def main():
     rag = RAGSystem(config)
     
     try:
-        # Get document path from user
-        doc_path = input("Enter the path to your document: ")
-        text = rag.load_document(doc_path)
+        # Use the provided pdf_filename
+        text = rag.load_document(pdf_filename)
         
         if text is None:
             print("Failed to load document. Exiting.")
@@ -321,12 +333,17 @@ def main():
         print(f"Completion output tokens: {final_costs['usage']['completion_output_tokens']:,}")
         print("\nCosts:")
         print(f"Embedding cost: ${final_costs['costs']['embedding_cost']:.4f}")
-        print(f"Completion input cost: ${final_costs['costs']['completion_input_cost']:.4f}")
-        print(f"Completion output cost: ${final_costs['costs']['completion_output_cost']:.4f}")
+        print(f"Completion cost: ${final_costs['costs']['completion_cost']:.4f}")
         print(f"Total cost: ${final_costs['costs']['total_cost']:.4f}")
                 
     except Exception as e:
         print(f"Error: {e}")
 
 if __name__ == "__main__":
+    # Define the variables at module level
+    # embedding_model: str = "text-embedding-3-small"
+    # embedding_price_per_million: float = 0.02
+    # completion_price_per_million: float = 0.6
+    pdf_filename: str = "report.pdf"
+    
     main()
