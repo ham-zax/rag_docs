@@ -1,5 +1,3 @@
-Okay, I'm ready to act as an Integrated Code Learning Architect. Let's break down this Python code for a Retrieval-Augmented Generation (RAG) system, focusing on a deep, engaging, and technically thorough understanding.
-
 ### **Part 1: Narrative Introduction - The Intelligent Document Oracle**
 
 Imagine you're an explorer in a vast digital library. This library isn't filled with dusty books, but with something far more powerful: a system that can understand and answer questions from a vast collection of documents. This system, known as the Intelligent Document Oracle, is powered by a technology called Retrieval-Augmented Generation (RAG).
