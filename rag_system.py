@@ -9,6 +9,11 @@ from pathlib import Path
 import pickle
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from functools import lru_cache
+from dotenv import load_dotenv
+
+# Load environment variables and set OpenAI API key
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Custom exceptions
 class RAGError(Exception):
@@ -29,9 +34,9 @@ class RAGConfig:
     chunk_size: int = 500
     chunk_overlap: int = 100
     embedding_model: str = "text-embedding-3-small"
-    completion_model: str = "gpt-4"
+    completion_model: str = "gpt-4o-mini"
     embedding_dimension: int = 1536
-    max_context_chunks: int = 3
+    max_context_chunks: int = 7
     cache_dir: Path = Path("./cache")
 
 class RAGSystem:
