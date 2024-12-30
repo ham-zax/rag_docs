@@ -1,39 +1,32 @@
-import openai
-import pymupdf
-import faiss
-import numpy as np
-import os
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 from pathlib import Path
-import pickle
+import hashlib
+import json
+from datetime import datetime
+
+import openai
+import pymupdf
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
+from qdrant_client.http.models import Distance, VectorParams
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from functools import lru_cache
-
-# Custom exceptions
-class RAGError(Exception):
-    """Base exception for RAG system"""
-    pass
-
-class DocumentLoadError(RAGError):
-    """Raised when document loading fails"""
-    pass
-
-class EmbeddingError(RAGError):
-    """Raised when embedding generation fails"""
-    pass
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
 
 @dataclass
 class RAGConfig:
     """Configuration for RAG system"""
+    collection_name: str = "documents"
     chunk_size: int = 500
     chunk_overlap: int = 100
     embedding_model: str = "text-embedding-3-small"
-    completion_model: str = "gpt-4"
+    completion_model: str = "gpt-4o-mini"
     embedding_dimension: int = 1536
     max_context_chunks: int = 3
-    cache_dir: Path = Path("./cache")
-
+    qdrant_path: str = "./qdrant_data"
+    
 class RAGSystem:
     def __init__(self, config: Optional[RAGConfig] = None):
         """Initialize RAG system with optional configuration"""
@@ -42,171 +35,207 @@ class RAGSystem:
             chunk_size=self.config.chunk_size,
             chunk_overlap=self.config.chunk_overlap
         )
-        self.index = faiss.IndexFlatL2(self.config.embedding_dimension)
-        self.chunks: List[str] = []
-        self._setup_cache()
         
-    def _setup_cache(self) -> None:
-        """Setup cache directory"""
-        self.config.cache_dir.mkdir(exist_ok=True)
+        # Initialize Qdrant client
+        self.qdrant = QdrantClient(path=self.config.qdrant_path)
+        self._init_collection()
         
-    def load_document(self, file_path: str) -> str:
-        """
-        Load and extract text from PDF document
+        # Conversation history
+        self.conversation_history: List[Dict[str, str]] = []
         
-        Args:
-            file_path: Path to PDF document
-            
-        Returns:
-            Extracted text from document
-            
-        Raises:
-            DocumentLoadError: If document loading fails
-        """
+    def _init_collection(self) -> None:
+        """Initialize Qdrant collection with hybrid search capabilities"""
         try:
+            self.qdrant.get_collection(self.config.collection_name)
+        except:
+            self.qdrant.create_collection(
+                collection_name=self.config.collection_name,
+                vectors_config=VectorParams(
+                    size=self.config.embedding_dimension,
+                    distance=Distance.COSINE
+                ),
+                # Enable payload indexing for hybrid search
+                optimizers_config=models.OptimizersConfigDiff(
+                    indexing_threshold=0,  # Index all vectors
+                ),
+                # Enable full-text search on content field
+                on_disk_payload=True
+            )
+            
+    def _get_document_hash(self, content: str) -> str:
+        """Generate hash for document content"""
+        return hashlib.md5(content.encode()).hexdigest()
+        
+    def load_document(self, file_path: str) -> Optional[str]:
+        """Load document and process if not already in database"""
+        try:
+            # Load document
             doc = pymupdf.open(file_path)
-            full_text = ""
+            content = ""
             for page in doc:
-                full_text += page.get_text()
+                content += page.get_text()
             doc.close()
-            return full_text
+            
+            # Check if document already processed
+            doc_hash = self._get_document_hash(content)
+            existing = self.qdrant.scroll(
+                collection_name=self.config.collection_name,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="doc_hash",
+                            match=models.MatchValue(value=doc_hash)
+                        )
+                    ]
+                )
+            )
+            
+            if not existing[0]:  # Document not found
+                self.process_text(content, doc_hash)
+                
+            return content
+            
         except Exception as e:
-            raise DocumentLoadError(f"Failed to load document: {e}")
+            print(f"Error loading document: {e}")
+            return None
             
-    def process_text(self, text: str) -> None:
-        """
-        Split text into chunks and generate embeddings
+    def process_text(self, text: str, doc_hash: str) -> None:
+        """Process text and store in Qdrant"""
+        # Split text into chunks
+        chunks = self.text_splitter.split_text(text)
         
-        Args:
-            text: Text to process
-        """
-        self.chunks = self.text_splitter.split_text(text)
-        embeddings = self._batch_get_embeddings(self.chunks)
-        self.index.add(np.array(embeddings, dtype='float32'))
-        self._save_state()
-        
-    @lru_cache(maxsize=1000)
-    def get_embedding(self, text: str) -> np.ndarray:
-        """
-        Generate OpenAI embedding for text with caching
-        
-        Args:
-            text: Text to embed
+        # Prepare points for Qdrant
+        points = []
+        for i, chunk in enumerate(chunks):
+            embedding = self.get_embedding(chunk)
             
-        Returns:
-            Text embedding
+            points.append(models.PointStruct(
+                id=len(points),
+                vector=embedding,
+                payload={
+                    "content": chunk,
+                    "doc_hash": doc_hash,
+                    "chunk_index": i,
+                    "timestamp": datetime.now().isoformat()
+                }
+            ))
             
-        Raises:
-            EmbeddingError: If embedding generation fails
-        """
+        # Upload to Qdrant in batches
+        BATCH_SIZE = 100
+        for i in range(0, len(points), BATCH_SIZE):
+            batch = points[i:i + BATCH_SIZE]
+            self.qdrant.upsert(
+                collection_name=self.config.collection_name,
+                points=batch
+            )
+            
+    def get_embedding(self, text: str) -> List[float]:
+        """Generate embedding for text"""
         try:
             response = openai.embeddings.create(
                 input=[text],
                 model=self.config.embedding_model
             )
-            return np.array(response.data[0].embedding, dtype='float32')
+            return response.data[0].embedding
         except Exception as e:
-            raise EmbeddingError(f"Failed to generate embedding: {e}")
+            print(f"Error generating embedding: {e}")
+            return []
             
-    def _batch_get_embeddings(self, texts: List[str]) -> List[np.ndarray]:
-        """Generate embeddings in batches"""
-        return [self.get_embedding(text) for text in texts]
-            
-    def query(self, question: str, k: Optional[int] = None) -> Optional[str]:
-        """
-        Query the RAG system
-        
-        Args:
-            question: Query question
-            k: Number of relevant chunks to retrieve
-            
-        Returns:
-            Generated answer
-        """
+    def query(self, question: str) -> Optional[str]:
+        """Query the RAG system with hybrid search"""
         try:
-            k = k or self.config.max_context_chunks
-            query_embedding = self.get_embedding(question)
+            # Generate question embedding
+            question_embedding = self.get_embedding(question)
             
-            distances, indices = self.index.search(
-                np.array([query_embedding], dtype='float32'), k
+            # Hybrid search using both semantic and keyword matching
+            search_result = self.qdrant.search(
+                collection_name=self.config.collection_name,
+                query_vector=question_embedding,
+                query_filter=None,  # Can add filters if needed
+                limit=self.config.max_context_chunks,
+                search_params=models.SearchParams(
+                    hnsw_ef=128,  # Increase for better recall
+                    exact=False   # Set to True for exact search
+                ),
+                with_payload=True,
+                score_threshold=0.0  # Adjust based on needs
             )
             
-            relevant_chunks = [self.chunks[i] for i in indices[0]]
-            return self.generate_answer(question, relevant_chunks)
+            # Extract relevant chunks
+            relevant_chunks = [hit.payload["content"] for hit in search_result]
             
-        except RAGError as e:
+            # Generate answer
+            answer = self.generate_answer(question, relevant_chunks)
+            
+            # Update conversation history
+            self.conversation_history.append({
+                "question": question,
+                "answer": answer,
+                "timestamp": datetime.now().isoformat()
+            })
+            
+            return answer
+            
+        except Exception as e:
             print(f"Error during query: {e}")
             return None
             
     def generate_answer(self, question: str, context_chunks: List[str]) -> str:
-        """
-        Generate answer using OpenAI GPT model
-        
-        Args:
-            question: Query question
-            context_chunks: Relevant context chunks
-            
-        Returns:
-            Generated answer
-        """
+        """Generate answer using conversation history and context"""
         try:
+            # Build context from chunks and recent conversation
             context = "\n\n---\n\n".join(context_chunks)
-            prompt = self._build_prompt(question, context)
             
+            # Include recent conversation history
+            conv_context = ""
+            if self.conversation_history:
+                recent_conv = self.conversation_history[-3:]  # Last 3 exchanges
+                conv_context = "\n".join([
+                    f"Q: {conv['question']}\nA: {conv['answer']}"
+                    for conv in recent_conv
+                ])
+            
+            # Build prompt
+            prompt = f"""Please answer the following question based on the provided context.
+            If the answer cannot be derived from the context, say so.
+
+            Previous conversation:
+            {conv_context}
+
+            Context:
+            {context}
+
+            Question: {question}
+            
+            Answer:"""
+            
+            # Generate response
             response = openai.chat.completions.create(
                 model=self.config.completion_model,
                 messages=[{"role": "user", "content": prompt}]
             )
+            
             return response.choices[0].message.content
             
         except Exception as e:
-            raise RAGError(f"Failed to generate answer: {e}")
-            
-    def _build_prompt(self, question: str, context: str) -> str:
-        """Build prompt for answer generation"""
-        return f"""Please answer the following question based on the provided context. 
-        If the answer cannot be derived from the context, say so.
-
-        Context:
-        {context}
-
-        Question: {question}
-        
-        Answer:"""
-        
-    def _save_state(self) -> None:
-        """Save system state to cache"""
-        state = {
-            'chunks': self.chunks,
-            'index': faiss.serialize_index(self.index)
-        }
-        with open(self.config.cache_dir / 'state.pkl', 'wb') as f:
-            pickle.dump(state, f)
-            
-    def _load_state(self) -> None:
-        """Load system state from cache"""
-        try:
-            with open(self.config.cache_dir / 'state.pkl', 'rb') as f:
-                state = pickle.load(f)
-            self.chunks = state['chunks']
-            self.index = faiss.deserialize_index(state['index'])
-        except FileNotFoundError:
-            pass
+            print(f"Error generating answer: {e}")
+            return ""
 
 def main():
     """Example usage"""
     config = RAGConfig(
         chunk_size=1000,
         chunk_overlap=200,
-        cache_dir=Path("./rag_cache")
+        qdrant_path="./qdrant_data"
     )
     
     rag = RAGSystem(config)
     
     try:
+        # Load document
         text = rag.load_document("document.pdf")
-        rag.process_text(text)
         
+        # Interactive query loop
         while True:
             question = input("Enter your question (or 'quit' to exit): ")
             if question.lower() == 'quit':
@@ -216,7 +245,7 @@ def main():
             if answer:
                 print(f"Answer: {answer}")
                 
-    except RAGError as e:
+    except Exception as e:
         print(f"Error: {e}")
 
 if __name__ == "__main__":
