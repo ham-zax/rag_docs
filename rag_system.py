@@ -44,6 +44,13 @@ class RAGSystem:
         # Conversation history
         self.conversation_history: List[Dict[str, str]] = []
         
+        # Add to existing init
+        self.usage_stats = {
+            "embedding_tokens": 0,
+            "completion_input_tokens": 0,
+            "completion_output_tokens": 0
+        }
+
     def _init_collection(self) -> None:
         """Initialize Qdrant collection with hybrid search capabilities"""
         try:
@@ -124,12 +131,10 @@ Would you like to proceed? (yes/no)""")
             existing = self.qdrant.scroll(
                 collection_name=self.config.collection_name,
                 scroll_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="doc_hash",
-                            match=models.MatchValue(value=doc_hash)
-                        )
-                    ]
+                    must=[models.FieldCondition(
+                        key="doc_hash",
+                        match=models.MatchValue(value=doc_hash)
+                    )]
                 )
             )
 
@@ -174,19 +179,37 @@ Would you like to proceed? (yes/no)""")
             
     def get_embedding(self, text: str) -> List[float]:
         """Generate embedding for text"""
+        if not text or not text.strip():
+            raise ValueError("Empty or invalid input text")
         try:
+            # Ensure text is properly formatted
+            cleaned_text = text.strip()
             response = openai.embeddings.create(
-                input=[text],
+                input=cleaned_text,
                 model=self.config.embedding_model
-            )
-            return response.data[0].embedding
+                )
+        
+            if not response.data or not response.data[0].embedding:
+                raise ValueError("No embedding generated")
+            embedding = response.data[0].embedding
+            if len(embedding) != self.config.embedding_dimension:
+                raise ValueError(f"Invalid embedding dimension: {len(embedding)}")    
+            # Track embedding tokens
+            self.usage_stats["embedding_tokens"] += response.usage.total_tokens
+            return embedding
         except Exception as e:
             print(f"Error generating embedding: {e}")
             return []
             
     def query(self, question: str) -> Optional[str]:
         """Query the RAG system with hybrid search"""
+        if not question or not question.strip():
+            return "Please provide a valid question."
+        
         try:
+            question_embedding = self.get_embedding(question)
+            if not question_embedding:
+                return "Unable to process question. Please try again."
             # Generate question embedding
             question_embedding = self.get_embedding(question)
             
@@ -258,14 +281,36 @@ Would you like to proceed? (yes/no)""")
                 messages=[{"role": "user", "content": prompt}]
             )
             
+            # Track completion tokens
+            self.usage_stats["completion_input_tokens"] += response.usage.prompt_tokens
+            self.usage_stats["completion_output_tokens"] += response.usage.completion_tokens
+            
             return response.choices[0].message.content
             
         except Exception as e:
             print(f"Error generating answer: {e}")
             return ""
 
+    def calculate_final_costs(self) -> Dict[str, float]:
+        """Calculate final costs based on usage"""
+        embedding_cost = (self.usage_stats["embedding_tokens"] / 1_000_000) * 0.02
+        completion_input_cost = (self.usage_stats["completion_input_tokens"] / 1_000_000) * 0.15
+        completion_output_cost = (self.usage_stats["completion_output_tokens"] / 1_000_000) * 0.60
+        
+        total_cost = embedding_cost + completion_input_cost + completion_output_cost
+        
+        return {
+            "usage": self.usage_stats,
+            "costs": {
+                "embedding_cost": embedding_cost,
+                "completion_input_cost": completion_input_cost,
+                "completion_output_cost": completion_output_cost,
+                "total_cost": total_cost
+            }
+        }
+
 def main():
-    """Example usage"""
+    """Modified main function with cost reporting"""
     config = RAGConfig(
         chunk_size=1000,
         chunk_overlap=200,
@@ -276,7 +321,7 @@ def main():
     
     try:
         # Load document
-        text = rag.load_document("constitutionofindiaacts.pdf")
+        text = rag.load_document("report.pdf")
         
         # Interactive query loop
         while True:
@@ -287,6 +332,20 @@ def main():
             answer = rag.query(question)
             if answer:
                 print(f"Answer: {answer}")
+        
+        # Display final costs
+        final_costs = rag.calculate_final_costs()
+        print("\nFinal Usage and Cost Report")
+        print("==========================")
+        print("\nToken Usage:")
+        print(f"Embedding tokens: {final_costs['usage']['embedding_tokens']:,}")
+        print(f"Completion input tokens: {final_costs['usage']['completion_input_tokens']:,}")
+        print(f"Completion output tokens: {final_costs['usage']['completion_output_tokens']:,}")
+        print("\nCosts:")
+        print(f"Embedding cost: ${final_costs['costs']['embedding_cost']:.4f}")
+        print(f"Completion input cost: ${final_costs['costs']['completion_input_cost']:.4f}")
+        print(f"Completion output cost: ${final_costs['costs']['completion_output_cost']:.4f}")
+        print(f"Total cost: ${final_costs['costs']['total_cost']:.4f}")
                 
     except Exception as e:
         print(f"Error: {e}")
