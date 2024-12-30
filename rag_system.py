@@ -48,7 +48,7 @@ class RAGSystem:
         try:
             response = openai.embeddings.create(
                 input=[text],
-                model="text-embedding-ada-002"
+                model="text-embedding-3-small"
             )
             return response.data[0].embedding
         except Exception as e:
@@ -81,7 +81,7 @@ class RAGSystem:
         try:
             prompt = f"Answer the following question based on the context provided:\n\nContext:\n{context}\n\nQuestion: {question}"
             response = openai.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}]
             )
             return response.choices[0].message.content
