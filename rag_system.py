@@ -5,7 +5,8 @@ import hashlib
 from datetime import datetime
 import os
 
-import openai
+from openai import OpenAI
+
 import pymupdf
 import tiktoken
 from qdrant_client import QdrantClient
@@ -18,9 +19,16 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_community.chat_message_histories import FileChatMessageHistory
 from langchain_openai import ChatOpenAI
+from langchain_community.document_loaders.csv_loader import CSVLoader
 
 from dotenv import load_dotenv
 load_dotenv()
+# Load OpenAI API key from environment
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+# Import tqdm for progress bars
+from tqdm import tqdm
 
 @dataclass
 class RAGConfig:
@@ -42,31 +50,36 @@ class RAGConfig:
 class RAGSystem:
     def __init__(self, config: Optional[RAGConfig] = None):
         self.config = config or RAGConfig()
+
+        print("Initializing text splitter...")
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.config.chunk_size,
             chunk_overlap=self.config.chunk_overlap
         )
+
+        print("Connecting to Qdrant client...")
         self.qdrant = QdrantClient(path=self.config.qdrant_path)
         self._init_collection()
-        
+
         # Ensure message store directory exists
         os.makedirs(self.config.message_store_path, exist_ok=True)
-        
+
         # Create LCEL chain components
+        print("Setting up language model and prompts...")
         self.prompt = ChatPromptTemplate.from_messages([
             ("system", "You are a helpful assistant answering questions based on the provided context."),
             MessagesPlaceholder(variable_name="history"),
             ("human", "Context: {context}\n\nQuestion: {question}")
         ])
-        
+
         self.llm = ChatOpenAI(
             model=self.config.completion_model,
             temperature=0
         )
-        
+
         # Construct LCEL chain
         self.chain = self.prompt | self.llm | StrOutputParser()
-        
+
         # Wrap with message history
         self.chain_with_history = RunnableWithMessageHistory(
             self.chain,
@@ -76,14 +89,17 @@ class RAGSystem:
             input_messages_key="question",
             history_messages_key="history"
         )
-        
+
         self.usage_stats = {"embedding_tokens": 0, "completion_tokens": 0}
 
     def _init_collection(self) -> None:
         """Initialize Qdrant collection if it doesn't exist"""
         try:
+            print(f"Checking if collection '{self.config.collection_name}' exists...")
             self.qdrant.get_collection(self.config.collection_name)
+            print("Collection exists.")
         except:
+            print(f"Collection '{self.config.collection_name}' not found. Creating new collection...")
             self.qdrant.create_collection(
                 collection_name=self.config.collection_name,
                 vectors_config=VectorParams(
@@ -91,15 +107,52 @@ class RAGSystem:
                     distance=Distance.COSINE
                 )
             )
+            print("Collection created.")
 
-    def load_document(self, file_path: str) -> Optional[str]:
-        """Load and process document"""
+    def load_csv(self, file_path: str) -> Optional[str]:
+        """Load and process CSV document"""
         try:
-            doc = pymupdf.open(file_path)
-            content = " ".join(page.get_text() for page in doc)
-            doc.close()
+            print(f"Loading CSV file: {file_path}")
+            loader = CSVLoader(
+                file_path=file_path,
+                csv_args={
+                    "delimiter": ",",
+                    "quotechar": '"',
+                }
+            )
 
-            doc_hash = hashlib.md5(content.encode()).hexdigest()
+            # Load CSV data
+            documents = loader.load()
+            print(f"Loaded {len(documents)} records from CSV.")
+
+            # Process each document with metadata
+            processed_content = []
+            print("Processing documents and extracting metadata...")
+            for doc in tqdm(documents, desc="Processing Documents"):
+                content = doc.page_content
+                metadata = {
+                    "offense": doc.metadata.get("Offense", ""),
+                    "punishment": doc.metadata.get("Punishment", ""),
+                    "section": doc.metadata.get("Section", "")
+                }
+
+                # Combine content with metadata
+                processed_text = f"""
+                Section: {metadata['section']}
+                Offense: {metadata['offense']}
+                Punishment: {metadata['punishment']}
+                Description: {content}
+                """
+                processed_content.append(processed_text)
+
+            # Join all processed content
+            full_content = "\n\n".join(processed_content)
+
+            # Generate document hash
+            doc_hash = hashlib.md5(full_content.encode()).hexdigest()
+
+            # Check if already processed
+            print("Checking if document has been previously processed...")
             existing = self.qdrant.scroll(
                 collection_name=self.config.collection_name,
                 scroll_filter=models.Filter(
@@ -111,19 +164,77 @@ class RAGSystem:
             )
 
             if not existing[0]:
-                self.process_text(content, doc_hash)
-            return content
+                print("Document is new. Processing text and generating embeddings...")
+                self.process_text(full_content, doc_hash)
+            else:
+                print("Document already exists in the collection. Skipping processing.")
+
+            return full_content
+
+        except Exception as e:
+            print(f"Error loading CSV document: {e}")
+            print(f"File path attempted: {os.path.abspath(file_path)}")
+            return None
+
+    def load_document(self, file_path: str) -> Optional[str]:
+        """Load document based on file type"""
+        try:
+            # Detect file type
+            file_ext = Path(file_path).suffix.lower()
+            print(f"Detected file type: {file_ext}")
+
+            if file_ext == '.pdf':
+                return self._load_pdf(file_path)
+            elif file_ext == '.csv':
+                return self.load_csv(file_path)
+            else:
+                raise ValueError(f"Unsupported file type: {file_ext}")
 
         except Exception as e:
             print(f"Error loading document: {e}")
             return None
 
+    def _load_pdf(self, file_path: str) -> Optional[str]:
+        """Load PDF document (existing implementation)"""
+        try:
+            print(f"Loading PDF file: {file_path}")
+            doc = pymupdf.open(file_path)
+            print("Extracting text from PDF...")
+            content = " ".join(page.get_text() for page in tqdm(doc, desc="Processing PDF Pages"))
+            doc.close()
+
+            doc_hash = hashlib.md5(content.encode()).hexdigest()
+            print("Checking if PDF has been previously processed...")
+            existing = self.qdrant.scroll(
+                collection_name=self.config.collection_name,
+                scroll_filter=models.Filter(
+                    must=[models.FieldCondition(
+                        key="doc_hash",
+                        match=models.MatchValue(value=doc_hash)
+                    )]
+                )
+            )
+
+            if not existing[0]:
+                print("PDF is new. Processing text and generating embeddings...")
+                self.process_text(content, doc_hash)
+            else:
+                print("PDF already exists in the collection. Skipping processing.")
+            return content
+
+        except Exception as e:
+            print(f"Error loading PDF document: {e}")
+            return None
+
     def process_text(self, text: str, doc_hash: str) -> None:
         """Process and store text chunks"""
+        print("Splitting text into chunks...")
         chunks = self.text_splitter.split_text(text)
+        print(f"Total chunks created: {len(chunks)}")
         points = []
 
-        for i, chunk in enumerate(chunks):
+        print("Generating embeddings for each chunk...")
+        for i, chunk in enumerate(tqdm(chunks, desc="Generating Embeddings")):
             embedding = self.get_embedding(chunk)
             if embedding:
                 points.append(models.PointStruct(
@@ -133,18 +244,20 @@ class RAGSystem:
                 ))
 
         if points:
+            print("Uploading embeddings to Qdrant...")
             self.qdrant.upsert(
                 collection_name=self.config.collection_name,
                 points=points
             )
+            print("Embeddings uploaded successfully.")
+        else:
+            print("No embeddings were generated. Skipping upload.")
 
     def get_embedding(self, text: str) -> Optional[List[float]]:
         """Generate embeddings for text"""
         try:
-            response = openai.embeddings.create(
-                input=text.strip(),
-                model=self.config.embedding_model
-            )
+            response = client.embeddings.create(input=text.strip(),
+            model=self.config.embedding_model)
             self.usage_stats["embedding_tokens"] += response.usage.total_tokens
             return response.data[0].embedding
         except Exception as e:
@@ -154,14 +267,12 @@ class RAGSystem:
     def query(self, question: str, session_id: str = "default") -> Optional[str]:
         """Query using LCEL chain with message history"""
         try:
+            print("Generating embedding for the question...")
             question_embedding = self.get_embedding(question)
             if not question_embedding:
                 return "Unable to process question."
 
-            # Debug: Print question embedding (truncated)
-            # print("\nDEBUG: Question Embedding (first 5 dimensions):")
-            # print(question_embedding[:5])
-
+            print("Searching for relevant context in Qdrant...")
             search_result = self.qdrant.search(
                 collection_name=self.config.collection_name,
                 query_vector=question_embedding,
@@ -169,18 +280,10 @@ class RAGSystem:
                 with_payload=True
             )
 
-            # Debug: Print search results with scores
-            # print("\nDEBUG: Top matched chunks with scores:")
-            # for i, hit in enumerate(search_result):
-                # print(f"\nMatch {i+1} (Score: {hit.score:.4f}):")
-                # # print(f"Content preview: {hit.payload['content'][:200]}...")
-
+            print(f"Found {len(search_result)} relevant context chunks.")
             context = " ".join(hit.payload["content"] for hit in search_result)
 
-            # Debug: Print context length and preview
-            # print(f"\nDEBUG: Total context length: {len(context)} characters")
-            # print(f"Context preview: {context[:200]}...")
-
+            print("Generating response from the language model...")
             response = self.chain_with_history.invoke(
                 {"question": question, "context": context},
                 config={"configurable": {"session_id": session_id}}
@@ -194,7 +297,6 @@ class RAGSystem:
         except Exception as e:
             print(f"Query error: {e}")
             return None
-
 
     def get_embedding_cost(self) -> float:
         """Calculate embedding cost"""
@@ -214,12 +316,15 @@ class RAGSystem:
         }
 
 def main():
+    print("Starting RAG System...")
     rag = RAGSystem()
 
     try:
-        if rag.load_document("report.pdf"):
+        document_path = "ipc_sections.csv"  # Replace with your document path
+        print(f"Loading document: {document_path}")
+        if rag.load_document(document_path):
             session_id = f"user_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            
+
             while True:
                 question = input("\nEnter question (or 'quit'): ")
                 if question.lower() == 'quit':
